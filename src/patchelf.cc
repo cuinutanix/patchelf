@@ -495,8 +495,14 @@ static void writeFile(std::string fileName, FileContents contents)
     if (fd == -1)
         error("open");
 
-    if (write(fd, contents->data(), contents->size()) != (off_t) contents->size())
-        error("write");
+    const size_t size = contents->size();
+    for (size_t off = 0; off < size;) {
+        ssize_t count = write(fd, contents->data() + off, size - off);
+        if (count <= 0) {
+            throw SysError(fmt("writing '", fileName, "'"));
+        }
+        off += count;
+    }
 
     if (close(fd) != 0)
         error("close");
