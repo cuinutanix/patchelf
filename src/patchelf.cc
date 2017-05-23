@@ -16,6 +16,10 @@
  *  along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+
 #include <string>
 #include <vector>
 #include <set>
@@ -32,9 +36,11 @@
 #include <cassert>
 #include <cstring>
 #include <cerrno>
+#include <cstdint>
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -48,7 +54,57 @@ static bool forceRPath = false;
 static std::string fileName;
 static int pageSize = PAGESIZE;
 
-typedef std::shared_ptr<std::vector<unsigned char>> FileContents;
+class MmapFile {
+public:
+
+    MmapFile(int fd, size_t size, size_t capacity);
+    ~MmapFile() { Close(); }
+
+    void Close();
+
+    size_t size() const { return size_; }
+    size_t capacity() const { return mmap_size_; }
+    uint8_t *data() const { return mmap_addr_; }
+    void resize(size_t size, uint8_t value);
+
+private:
+
+    int fd_;
+    uint8_t *mmap_addr_;
+    size_t mmap_size_;
+    size_t size_;
+};
+
+MmapFile::MmapFile(int fd, size_t size, size_t capacity)
+  : fd_(dup(fd)), size_(size)
+{
+    assert(fd_ >= 0);
+    const size_t page_size = getpagesize();
+    mmap_size_ = (capacity + page_size - 1) / page_size * page_size;
+    ftruncate(fd_, mmap_size_); // Grow the file so we don't get a SIGBUS.
+    mmap_addr_ = reinterpret_cast<uint8_t *>(
+        mmap(0, mmap_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0));
+    assert(mmap_addr_ != MAP_FAILED);
+}
+
+void MmapFile::resize(size_t size, uint8_t value)
+{
+    assert(size <= mmap_size_);
+    if (size > size_) memset(mmap_addr_ + size_, size - size_, value);
+    size_ = size;
+}
+
+void MmapFile::Close()
+{
+    if (fd_ >= 0) {
+        munmap(mmap_addr_, mmap_size_);
+        ftruncate(fd_, size_); // Truncate to actual size.
+        close(fd_);
+        fd_ = -1;
+    }
+}
+
+typedef std::shared_ptr<MmapFile> FileContents;
 
 
 #define ElfFileParams class Elf_Ehdr, class Elf_Phdr, class Elf_Shdr, class Elf_Addr, class Elf_Off, class Elf_Dyn, class Elf_Sym, class Elf_Verneed
@@ -313,24 +369,19 @@ static void growFile(FileContents contents, size_t newSize)
 static FileContents readFile(std::string fileName,
     size_t cutOff = std::numeric_limits<size_t>::max())
 {
+    int fd = open(fileName.c_str(), O_RDWR);
+    if (fd == -1) throw SysError(fmt("opening '", fileName, "'"));
+
     struct stat st;
-    if (stat(fileName.c_str(), &st) != 0)
+    if (fstat(fd, &st) != 0)
         throw SysError(fmt("getting info about '", fileName, "'"));
 
     if ((uint64_t) st.st_size > (uint64_t) std::numeric_limits<size_t>::max())
         throw SysError(fmt("cannot read file of size ", st.st_size, " into memory"));
 
     size_t size = std::min(cutOff, (size_t) st.st_size);
-
-    FileContents contents = std::make_shared<std::vector<unsigned char>>();
-    contents->reserve(size + 32 * 1024 * 1024);
-    contents->resize(size, 0);
-
-    int fd = open(fileName.c_str(), O_RDONLY);
-    if (fd == -1) throw SysError(fmt("opening '", fileName, "'"));
-
-    if ((size_t) read(fd, contents->data(), size) != size)
-        throw SysError(fmt("reading '", fileName, "'"));
+    size_t capacity = size + 32 * 1024 * 1024;
+    FileContents contents = std::make_shared<MmapFile>(fd, size, capacity);
 
     close(fd);
 
@@ -486,17 +537,8 @@ void ElfFile<ElfFileParamNames>::sortShdrs()
 
 static void writeFile(std::string fileName, FileContents contents)
 {
-    int fd = open(fileName.c_str(), O_TRUNC | O_WRONLY);
-    if (fd == -1)
-        error("open");
-
-    if (write(fd, contents->data(), contents->size()) != (off_t) contents->size())
-        error("write");
-
-    if (close(fd) != 0)
-        error("close");
+    contents->Close();
 }
-
 
 static unsigned int roundUp(unsigned int n, unsigned int m)
 {
