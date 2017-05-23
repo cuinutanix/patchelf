@@ -329,8 +329,13 @@ static FileContents readFile(std::string fileName,
     int fd = open(fileName.c_str(), O_RDONLY);
     if (fd == -1) throw SysError(fmt("opening '", fileName, "'"));
 
-    if ((size_t) read(fd, contents->data(), size) != size)
-        throw SysError(fmt("reading '", fileName, "'"));
+    for (size_t off = 0; off < size; ) {
+        ssize_t count = read(fd, contents->data() + off, size - off);
+        if (count <= 0) {
+            throw SysError(fmt("reading '", fileName, "'"));
+        }
+        off += count;
+    }
 
     close(fd);
 
