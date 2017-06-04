@@ -57,7 +57,15 @@ static int pageSize = PAGESIZE;
 class MmapFile {
 public:
 
-    MmapFile(int fd, size_t size, size_t capacity);
+    // Open the file for read-write, file can be resize()'d up to capacity.
+    MmapFile(int fd, size_t size, size_t capacity) : size_(size) {
+        Mmap(fd, true, capacity);
+    }
+    // Open the file for read-only, up to cutOff bytes can be read.
+    MmapFile(int fd, size_t cutOff) : size_(cutOff) {
+        Mmap(fd, false, cutOff);
+    }
+
     ~MmapFile() { Close(); }
 
     void Close();
@@ -69,21 +77,28 @@ public:
 
 private:
 
+    void Mmap(int fd, bool writable, size_t mmap_size);
+
     int fd_;
     uint8_t *mmap_addr_;
     size_t mmap_size_;
     size_t size_;
 };
 
-MmapFile::MmapFile(int fd, size_t size, size_t capacity)
-  : fd_(dup(fd)), size_(size)
+void MmapFile::Mmap(int fd, bool writable, size_t mmap_size)
 {
-    assert(fd_ >= 0);
     const size_t page_size = getpagesize();
-    mmap_size_ = (capacity + page_size - 1) / page_size * page_size;
-    ftruncate(fd_, mmap_size_); // Grow the file so we don't get a SIGBUS.
+    mmap_size_ = (mmap_size + page_size - 1) / page_size * page_size;
+    if (writable) {
+        ftruncate(fd, mmap_size_); // Grow the file so we don't get a SIGBUS.
+        fd_ = dup(fd); // Dup the fd so we can undo the ftruncate() on Close().
+        assert(fd_ >= 0);
+    } else {
+        fd_ = -1;
+    }
     mmap_addr_ = reinterpret_cast<uint8_t *>(
-        mmap(0, mmap_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0));
+        mmap(0, mmap_size_, PROT_READ | PROT_WRITE,
+             writable ? MAP_SHARED : MAP_PRIVATE, fd, 0));
     assert(mmap_addr_ != MAP_FAILED);
 }
 
@@ -96,8 +111,13 @@ void MmapFile::resize(size_t size, uint8_t value)
 
 void MmapFile::Close()
 {
-    if (fd_ >= 0) {
+    if (mmap_addr_) {
         munmap(mmap_addr_, mmap_size_);
+        mmap_addr_ = NULL;
+        mmap_size_ = 0;
+    }
+
+    if (fd_ >= 0) {
         ftruncate(fd_, size_); // Truncate to actual size.
         close(fd_);
         fd_ = -1;
@@ -372,6 +392,24 @@ static void growFile(FileContents contents, size_t newSize)
 static FileContents readFile(std::string fileName,
     size_t cutOff = std::numeric_limits<size_t>::max())
 {
+    int fd = open(fileName.c_str(), O_RDONLY);
+    if (fd == -1) throw SysError(fmt("opening '", fileName, "'"));
+
+    struct stat st;
+    if (fstat(fd, &st) != 0)
+        throw SysError(fmt("getting info about '", fileName, "'"));
+
+    cutOff = std::min(cutOff, (size_t)st.st_size);
+    FileContents contents = std::make_shared<MmapFile>(fd, cutOff);
+
+    close(fd);
+
+    return contents;
+}
+
+
+static FileContents openFile(std::string fileName)
+{
     int fd = open(fileName.c_str(), O_RDWR);
     if (fd == -1) throw SysError(fmt("opening '", fileName, "'"));
 
@@ -380,9 +418,9 @@ static FileContents readFile(std::string fileName,
         throw SysError(fmt("getting info about '", fileName, "'"));
 
     if ((uint64_t) st.st_size > (uint64_t) std::numeric_limits<size_t>::max())
-        throw SysError(fmt("cannot read file of size ", st.st_size, " into memory"));
+        throw SysError(fmt("cannot map file of size ", st.st_size, " into memory"));
 
-    size_t size = std::min(cutOff, (size_t) st.st_size);
+    size_t size = (size_t) st.st_size;
     size_t capacity = size + 32 * 1024 * 1024;
     FileContents contents = std::make_shared<MmapFile>(fd, size, capacity);
 
@@ -538,12 +576,6 @@ void ElfFile<ElfFileParamNames>::sortShdrs()
 
     /* And the .shstrtab index. */
     wri(hdr->e_shstrndx, findSection3(shstrtabName));
-}
-
-
-static void writeFile(std::string fileName, FileContents contents)
-{
-    contents->Close();
 }
 
 static unsigned int roundUp(unsigned int n, unsigned int m)
@@ -1633,7 +1665,7 @@ static void patchElf2(ElfFile && elfFile, std::string fileName)
 
     if (elfFile.isChanged()){
         elfFile.rewriteSections();
-        writeFile(fileName, elfFile.fileContents);
+        elfFile.fileContents->Close();
     }
 }
 
@@ -1646,7 +1678,7 @@ static void patchElf()
 
         debug("Kernel page size is %u bytes\n", getPageSize());
 
-        auto fileContents = readFile(fileName);
+        auto fileContents = openFile(fileName);
 
         if (getElfType(fileContents).is32Bit)
             patchElf2(ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Addr, Elf32_Off, Elf32_Dyn, Elf32_Sym, Elf32_Verneed>(fileContents), fileName);
