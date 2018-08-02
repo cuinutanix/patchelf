@@ -43,6 +43,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <endian.h>
 
 #include "elf.h"
 
@@ -294,37 +295,40 @@ private:
        specified by the ELF header) to this platform's integer
        representation. */
     template<class I>
-    I rdi(I i);
+    I rdi(I i)
+    {
+      static_assert(sizeof(I) == 1 ||
+                    sizeof(I) == 2 ||
+                    sizeof(I) == 4 ||
+                    sizeof(I) == 8,
+                    "rdi not implemented");
+      switch(sizeof(I)) {
+      case 1: return i;
+      case 2: return littleEndian ? le16toh(i) : be16toh(i);
+      case 4: return littleEndian ? le32toh(i) : be32toh(i);
+      case 8: return littleEndian ? le64toh(i) : be64toh(i);
+      }
+      // Not reached.
+    }
 
     /* Convert back to the ELF representation. */
     template<class I>
-    I wri(I & t, size_t i)
+    I wri(I& t, size_t i)
     {
-        t = rdi((I) i);
-        return i;
+      static_assert(sizeof(I) == 1 ||
+                    sizeof(I) == 2 ||
+                    sizeof(I) == 4 ||
+                    sizeof(I) == 8,
+                    "wri not implemented");
+      switch(sizeof(I)) {
+      case 1: return t = i;
+      case 2: return t = littleEndian ? htole16(i) : htobe16(i);
+      case 4: return t = littleEndian ? htole32(i) : htobe32(i);
+      case 8: return t = littleEndian ? htole64(i) : htobe64(i);
+      }
+      // Not reached.
     }
 };
-
-
-/* !!! G++ creates broken code if this function is inlined, don't know
-   why... */
-template<ElfFileParams>
-template<class I>
-I ElfFile<ElfFileParamNames>::rdi(I i)
-{
-    I r = 0;
-    if (littleEndian) {
-        for (size_t n = 0; n < sizeof(I); ++n) {
-            r |= ((I) *(((unsigned char *) &i) + n)) << (n * 8);
-        }
-    } else {
-        for (size_t n = 0; n < sizeof(I); ++n) {
-            r |= ((I) *(((unsigned char *) &i) + n)) << ((sizeof(I) - n - 1) * 8);
-        }
-    }
-    return r;
-}
-
 
 /* Ugly: used to erase DT_RUNPATH when using --force-rpath. */
 #define DT_IGNORE       0x00726e67
